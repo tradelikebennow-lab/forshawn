@@ -1,0 +1,329 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// Key Level Tracker (KLT)
+// ═══════════════════════════════════════════════════════════════════════════════
+// S&R zones + MTF trend bias dashboard
+// Zone engine: adapted from TLB
+// v2: proximity cull pass to reduce zone noise on lower TFs
+// Pine Script v5 — non-repainting
+// ═══════════════════════════════════════════════════════════════════════════════
+//@version=5
+indicator("Key Level Tracker",
+     shorttitle = "KLT",
+     overlay    = true,
+     max_boxes_count  = 50,
+     max_labels_count = 50,
+     max_lines_count  = 50,
+     max_bars_back    = 501)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+grpSwing = "══ Swing Detection ══"
+pivotLen = input.int(5, "Pivot Lookback", minval=2, maxval=50, group=grpSwing)
+ppsrc = input.string(defval="High/Low", title="Pivot Source", options=["High/Low", "Close/Open"], group=grpSwing, tooltip="High/Low uses wicks for pivots. Close/Open uses candle bodies only.")
+
+grpSR = "══ S&R Zones ══"
+ChannelW = input.int(defval=3, title="Maximum Channel Width %", minval=1, maxval=8, group=grpSR, tooltip="Zone width as % of the distance between highest/lowest in last 300 bars. Lower = tighter zones.")
+maxZones = input.int(5, "Max Zones on Chart", minval=1, maxval=10, group=grpSR, tooltip="Maximum S&R channels to display. Capped at 10 to stay within Pine execution limits.")
+loopback = input.int(defval=200, title="Loopback Period", minval=100, maxval=400, group=grpSR, tooltip="Checks pivots within this many bars back. Lower = focuses on more recent structure.")
+minStrength = input.int(defval=2, title="Minimum Strength", minval=1, group=grpSR, tooltip="Zone must contain at least this many pivot points. 2+ filters out weak single-touch zones.")
+cullNearby  = input.bool(true, "Cull Nearby Zones", group=grpSR, tooltip="When multiple zones sit close together, keep only the strongest and discard the rest.")
+cullDist    = input.float(1.5, "Cull Distance (× ATR)", minval=0.5, maxval=5.0, step=0.1, group=grpSR, tooltip="If two zone midpoints are closer than ATR(50) × this value, the weaker zone is discarded.")
+
+grpColors = "══ Colors ══"
+colBullish    = input.color(color.new(#089981, 0),  "Bullish",  group=grpColors)
+colBearish    = input.color(color.new(#f23645, 0),  "Bearish",  group=grpColors)
+colSideways   = input.color(color.new(#9598a1, 0),  "Sideways", group=grpColors)
+colSupport    = input.color(color.new(#089981, 75), "Zone — Support (price above)",    group=grpColors)
+colResistance = input.color(color.new(#f23645, 75), "Zone — Resistance (price below)", group=grpColors)
+colNeutral    = input.color(color.new(#9598a1, 75), "Zone — Price inside",             group=grpColors)
+
+grpDash = "══ Dashboard ══"
+showDashboard = input.bool(true, "Show Dashboard", group=grpDash)
+dashPos  = input.string("Top Right", "Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=grpDash)
+dashSize = input.string("Normal", "Text Size", options=["Small", "Normal", "Large"], group=grpDash)
+showW1  = input.bool(true, "W1", inline="dtf", group=grpDash)
+showD1  = input.bool(true, "D1", inline="dtf", group=grpDash)
+showH4  = input.bool(true, "H4", inline="dtf", group=grpDash)
+showH1  = input.bool(true, "H1", inline="dtf", group=grpDash)
+showM15 = input.bool(true, "M15", inline="dtf", group=grpDash)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STRUCTURE DETECTION — adapted from Trend by TLB
+// ─────────────────────────────────────────────────────────────────────────────
+// Tracks 3 consecutive swing highs and 3 consecutive swing lows.
+// Bullish: 3 ascending lows (HL sequence) OR close breaks above last swing high
+// Bearish: 3 descending highs (LH sequence) OR close breaks below last swing low
+// Sideways: neither condition met
+
+float src1 = ppsrc == "High/Low" ? high : math.max(close, open)
+float src2 = ppsrc == "High/Low" ? low  : math.min(close, open)
+
+// Auto pivot length per timeframe (larger pivots for lower TFs, smaller for higher)
+autoPivLen(tf) =>
+    tf == "1" ? 8 : tf == "5" ? 7 : tf == "15" ? 6 : tf == "30" ? 5 : tf == "60" ? 5 : tf == "240" ? 4 : tf == "D" ? 3 : tf == "W" ? 2 : 5
+
+// Structure calculation function — runs on any TF via request.security
+calcStructure(pLen) =>
+    _ph = ta.pivothigh(high, pLen, pLen)
+    _pl = ta.pivotlow(low, pLen, pLen)
+    var float h1 = na
+    var float h2 = na
+    var float h3 = na
+    var float l1 = na
+    var float l2 = na
+    var float l3 = na
+    if not na(_ph)
+        h3 := h2
+        h2 := h1
+        h1 := _ph
+    if not na(_pl)
+        l3 := l2
+        l2 := l1
+        l1 := _pl
+    hasHL   = not na(l1) and not na(l2) and not na(l3) and l1 > l2 and l2 > l3
+    hasLH   = not na(h1) and not na(h2) and not na(h3) and h1 < h2 and h2 < h3
+    bosUp   = not na(h1) and close > h1
+    bosDown = not na(l1) and close < l1
+    hasHL or bosUp ? 1 : hasLH or bosDown ? -1 : 0
+
+// Current TF structure (used for zone detection pivots too)
+float ph = ta.pivothigh(src1, pivotLen, pivotLen)
+float pl = ta.pivotlow(src2, pivotLen, pivotLen)
+
+int trendState = calcStructure(pivotLen)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MULTI-TIMEFRAME BIAS — structure on all 5 TFs
+// ─────────────────────────────────────────────────────────────────────────────
+
+int biasW1  = request.security(syminfo.tickerid, "W",   calcStructure(autoPivLen("W")),   lookahead=barmerge.lookahead_off)
+int biasD1  = request.security(syminfo.tickerid, "D",   calcStructure(autoPivLen("D")),   lookahead=barmerge.lookahead_off)
+int biasH4  = request.security(syminfo.tickerid, "240", calcStructure(autoPivLen("240")), lookahead=barmerge.lookahead_off)
+int biasH1  = request.security(syminfo.tickerid, "60",  calcStructure(autoPivLen("60")),  lookahead=barmerge.lookahead_off)
+int biasM15 = request.security(syminfo.tickerid, "15",  calcStructure(autoPivLen("15")),  lookahead=barmerge.lookahead_off)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S&R ZONE DETECTION — Lonesome's channel method on current TF
+// ─────────────────────────────────────────────────────────────────────────────
+
+float prdhighest = ta.highest(300)
+float prdlowest  = ta.lowest(300)
+float cwidth = (prdhighest - prdlowest) * ChannelW / 100.
+
+// ATR for cull distance calculation
+float atrVal = ta.atr(50)
+
+var float[] pivotVals = array.new_float(0)
+var int[]   pivotLocs = array.new_int(0)
+
+if not na(ph) or not na(pl)
+    array.unshift(pivotVals, not na(ph) ? ph : pl)
+    array.unshift(pivotLocs, bar_index)
+    for x = array.size(pivotVals) - 1 to 0
+        if bar_index - array.get(pivotLocs, x) > loopback
+            array.pop(pivotVals)
+            array.pop(pivotLocs)
+            continue
+        break
+
+get_sr_vals(ind) =>
+    float lo = array.get(pivotVals, ind)
+    float hi = lo
+    int numpp = 0
+    for y = 0 to array.size(pivotVals) - 1
+        float cpp = array.get(pivotVals, y)
+        float wdth = cpp <= hi ? hi - cpp : cpp - lo
+        if wdth <= cwidth
+            if cpp <= hi
+                lo := math.min(lo, cpp)
+            else
+                hi := math.max(hi, cpp)
+            numpp += 20
+    [hi, lo, numpp]
+
+// Over-collect zone candidates so the cull pass has enough to choose from.
+int collectMax = math.min(maxZones * 2, 10)
+var float[] srLevels = array.new_float(collectMax * 2, 0.0)
+var float[] srStren  = array.new_float(collectMax, 0.0)
+
+if not na(ph) or not na(pl)
+    float[] supres = array.new_float(0)
+
+    for x = 0 to array.size(pivotVals) - 1
+        [hi, lo, strength] = get_sr_vals(x)
+        array.push(supres, strength)
+        array.push(supres, hi)
+        array.push(supres, lo)
+
+    for x = 0 to array.size(pivotVals) - 1
+        float h = array.get(supres, x * 3 + 1)
+        float l = array.get(supres, x * 3 + 2)
+        int s = 0
+        for y = 0 to loopback
+            if (high[y] <= h and high[y] >= l) or (low[y] <= h and low[y] >= l)
+                s += 1
+        array.set(supres, x * 3, array.get(supres, x * 3) + s)
+
+    array.fill(srLevels, 0.0)
+    array.fill(srStren, 0.0)
+
+    int src = 0
+    for x = 0 to array.size(pivotVals) - 1
+        float stv = -1.0
+        int stl = -1
+        for y = 0 to array.size(pivotVals) - 1
+            if array.get(supres, y * 3) > stv and array.get(supres, y * 3) >= minStrength * 20
+                stv := array.get(supres, y * 3)
+                stl := y
+        if stl >= 0
+            float hh = array.get(supres, stl * 3 + 1)
+            float ll = array.get(supres, stl * 3 + 2)
+            array.set(srLevels, src * 2, hh)
+            array.set(srLevels, src * 2 + 1, ll)
+            array.set(srStren, src, array.get(supres, stl * 3))
+
+            for y = 0 to array.size(pivotVals) - 1
+                if (array.get(supres, y * 3 + 1) <= hh and array.get(supres, y * 3 + 1) >= ll) or (array.get(supres, y * 3 + 2) <= hh and array.get(supres, y * 3 + 2) >= ll)
+                    array.set(supres, y * 3, -1.0)
+
+            src += 1
+            if src >= collectMax
+                break
+
+    // Sort by strength descending
+    for x = 0 to collectMax - 2
+        for y = x + 1 to collectMax - 1
+            if array.get(srStren, y) > array.get(srStren, x)
+                float tmpS = array.get(srStren, y)
+                array.set(srStren, y, array.get(srStren, x))
+                array.set(srStren, x, tmpS)
+                float tmpT = array.get(srLevels, y * 2)
+                array.set(srLevels, y * 2, array.get(srLevels, x * 2))
+                array.set(srLevels, x * 2, tmpT)
+                float tmpB = array.get(srLevels, y * 2 + 1)
+                array.set(srLevels, y * 2 + 1, array.get(srLevels, x * 2 + 1))
+                array.set(srLevels, x * 2 + 1, tmpB)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROXIMITY CULL — keep strongest, discard weaker neighbours
+// ─────────────────────────────────────────────────────────────────────────────
+// Zones are sorted strongest-first. Walk top-down:
+//   - Keep zone if no already-kept zone has a midpoint within cullDist × ATR.
+//   - Otherwise discard — it's noise around a stronger level.
+// This is NOT a merge — zone boundaries stay the same, weak neighbours are
+// simply dropped so the chart only shows the dominant level per cluster.
+
+var float[] finalLevels = array.new_float(maxZones * 2, 0.0)
+
+if not na(ph) or not na(pl)
+    array.fill(finalLevels, 0.0)
+    float cullDistPrice = atrVal * cullDist
+    int kept = 0
+
+    for i = 0 to collectMax - 1
+        if kept >= maxZones
+            break
+        float topI = array.get(srLevels, i * 2)
+        float botI = array.get(srLevels, i * 2 + 1)
+        if topI == 0.0 and botI == 0.0
+            continue
+        float midI = (topI + botI) / 2.0
+
+        // Compare against all already-kept zones
+        bool tooClose = false
+        if cullNearby and kept > 0
+            for k = 0 to kept - 1
+                float topK = array.get(finalLevels, k * 2)
+                float botK = array.get(finalLevels, k * 2 + 1)
+                float midK = (topK + botK) / 2.0
+                if math.abs(midI - midK) < cullDistPrice
+                    tooClose := true
+                    break
+
+        if not tooClose
+            array.set(finalLevels, kept * 2,     topI)
+            array.set(finalLevels, kept * 2 + 1, botI)
+            kept += 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DRAW ZONES — only on last bar with dynamic coloring
+// ─────────────────────────────────────────────────────────────────────────────
+
+var box[] drawnBoxes = array.new_box(maxZones, na)
+
+if barstate.islast
+    for x = 0 to maxZones - 1
+        box.delete(array.get(drawnBoxes, x))
+        float top = array.get(finalLevels, x * 2)
+        float bot = array.get(finalLevels, x * 2 + 1)
+        if top != 0.0 or bot != 0.0
+            color zCol = close > top ? colSupport : close < bot ? colResistance : colNeutral
+            array.set(drawnBoxes, x, box.new(bar_index - 280, top, bar_index, bot, bgcolor=zCol, border_color=zCol, border_width=0, extend=extend.right))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD — Variation L: two-tone badges
+// ─────────────────────────────────────────────────────────────────────────────
+
+biasColor(b) =>
+    b == 1 ? colBullish : b == -1 ? colBearish : color.new(#3a3d45, 0)
+
+biasLabel(b) =>
+    b == 1 ? "Bull" : b == -1 ? "Bear" : "Side"
+
+biasTxtColor(b) =>
+    b == 1 ? color.white : b == -1 ? color.white : color.new(color.white, 55)
+
+tablePos = switch dashPos
+    "Top Left"     => position.top_left
+    "Top Right"    => position.top_right
+    "Bottom Left"  => position.bottom_left
+    "Bottom Right" => position.bottom_right
+    => position.top_right
+
+textSz = switch dashSize
+    "Small"  => size.tiny
+    "Normal" => size.small
+    "Large"  => size.normal
+    => size.small
+
+int badgeCount = 0
+if showW1
+    badgeCount += 1
+if showD1
+    badgeCount += 1
+if showH4
+    badgeCount += 1
+if showH1
+    badgeCount += 1
+if showM15
+    badgeCount += 1
+
+int totalCols = badgeCount * 2
+color dimBg = color.new(#2a2d35, 0)
+color dimTxt = color.new(color.white, 60)
+
+var table dashTable = table.new(tablePos, totalCols, 1, bgcolor=color.new(#1a1d24, 0), border_color=color.new(#1a1d24, 100), border_width=0, frame_color=color.new(#1a1d24, 0), frame_width=1)
+
+if showDashboard and barstate.islast
+    int col = 0
+    if showW1
+        table.cell(dashTable, col,     0, " W1 ",  text_color=dimTxt, text_size=textSz, bgcolor=dimBg)
+        table.cell(dashTable, col + 1, 0, biasLabel(biasW1), text_color=biasTxtColor(biasW1), text_size=textSz, bgcolor=biasColor(biasW1))
+        col += 2
+    if showD1
+        table.cell(dashTable, col,     0, " D1 ",  text_color=dimTxt, text_size=textSz, bgcolor=dimBg)
+        table.cell(dashTable, col + 1, 0, biasLabel(biasD1), text_color=biasTxtColor(biasD1), text_size=textSz, bgcolor=biasColor(biasD1))
+        col += 2
+    if showH4
+        table.cell(dashTable, col,     0, " H4 ",  text_color=dimTxt, text_size=textSz, bgcolor=dimBg)
+        table.cell(dashTable, col + 1, 0, biasLabel(biasH4), text_color=biasTxtColor(biasH4), text_size=textSz, bgcolor=biasColor(biasH4))
+        col += 2
+    if showH1
+        table.cell(dashTable, col,     0, " H1 ",  text_color=dimTxt, text_size=textSz, bgcolor=dimBg)
+        table.cell(dashTable, col + 1, 0, biasLabel(biasH1), text_color=biasTxtColor(biasH1), text_size=textSz, bgcolor=biasColor(biasH1))
+        col += 2
+    if showM15
+        table.cell(dashTable, col,     0, " M15 ", text_color=dimTxt, text_size=textSz, bgcolor=dimBg)
+        table.cell(dashTable, col + 1, 0, biasLabel(biasM15), text_color=biasTxtColor(biasM15), text_size=textSz, bgcolor=biasColor(biasM15))
