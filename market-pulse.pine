@@ -1,0 +1,110 @@
+// © Inspired by CYCLE
+// Independent build using publicly available macro data
+// NOT a copy of the original indicator (protected source)
+
+//@version=6
+indicator("Market Pulse [TX]", shorttitle="Market Pulse [TX]", overlay=false, precision=2)
+
+// ─── HARDCODED PARAMETERS ─────────────────────────────────────────────
+// Weights
+float w_credit  = 1.0
+float w_vix     = 1.0
+float w_curve   = 0.7
+float w_breadth = 0.8
+
+// Z-score
+int   z_len = 252   // ~1 year of daily bars
+float z_cap = 4.0
+
+// Thresholds
+float t_stress  = -2.0
+float t_extreme = -4.0
+float t_crash   = -6.0
+
+// Smoothing
+int smooth_len = 3
+
+// ─── DATA ─────────────────────────────────────────────────────────────
+string res = "D"
+
+float raw_hy      = request.security("FRED:BAMLH0A0HYM2", res, close)
+float raw_vix     = request.security("CBOE:VIX",           res, close)
+float raw_10y     = request.security("TVC:US10Y",          res, close)
+float raw_02y     = request.security("TVC:US02Y",          res, close)
+float raw_breadth = request.security("MMTH",               res, close)
+
+// Fill forward na gaps
+float hy_oas  = ta.valuewhen(not na(raw_hy),      raw_hy,      0)
+float vix     = ta.valuewhen(not na(raw_vix),     raw_vix,     0)
+float us10y   = ta.valuewhen(not na(raw_10y),     raw_10y,     0)
+float us02y   = ta.valuewhen(not na(raw_02y),     raw_02y,     0)
+float breadth = ta.valuewhen(not na(raw_breadth), raw_breadth, 0)
+float curve   = us10y - us02y
+
+// ─── Z-SCORE ──────────────────────────────────────────────────────────
+zscore(float src, int len, float cap) =>
+    float mu = ta.sma(src, len)
+    float sd = ta.stdev(src, len)
+    float z  = sd > 0 ? (src - mu) / sd : 0.0
+    math.max(-cap, math.min(cap, z))
+
+float z_credit  = -zscore(hy_oas,  z_len, z_cap)
+float z_vix     = -zscore(vix,     z_len, z_cap)
+float z_curve   =  zscore(curve,   z_len, z_cap)
+float z_breadth =  zscore(breadth, z_len, z_cap)
+
+// ─── COMPOSITE ────────────────────────────────────────────────────────
+float total_w  = w_credit + w_vix + w_curve + w_breadth
+float raw_comp = (z_credit * w_credit + z_vix * w_vix + z_curve * w_curve + z_breadth * w_breadth) / total_w
+float scaled   = raw_comp * 1.5
+float regime   = ta.ema(scaled, smooth_len)
+
+// ─── COLORS ───────────────────────────────────────────────────────────
+color c_healthy = #00C853
+color c_neutral = #B2FF59
+color c_caution = #FFD600
+color c_stress  = #FF6D00
+color c_extreme = #FF1744
+color c_crash   = #D50000
+
+color regime_color = regime > 1.0        ? c_healthy :
+                     regime > 0          ? c_neutral :
+                     regime > t_stress   ? c_caution :
+                     regime > t_extreme  ? c_stress  :
+                     regime > t_crash    ? c_extreme :
+                     c_crash
+
+// ─── PLOTS ────────────────────────────────────────────────────────────
+plot(regime, "Risk Regime", color=regime_color, linewidth=2)
+
+hline(0,         "Green Light / Balance", color=color.new(color.white, 60), linestyle=hline.style_dotted)
+hline(t_stress,  "Risk-Off",              color=color.new(c_stress, 40),    linestyle=hline.style_dashed)
+hline(t_extreme, "Red Light",             color=color.new(c_extreme, 40),   linestyle=hline.style_dashed)
+hline(t_crash,   "Meltdown",              color=color.new(c_crash, 40),     linestyle=hline.style_dashed)
+
+bgcolor(regime <= t_crash   ? color.new(c_crash,   85) :
+        regime <= t_extreme ? color.new(c_extreme,  88) :
+        regime <= t_stress  ? color.new(c_stress,   90) :
+        na)
+
+// ─── REGIME LABELS ON LINES ───────────────────────────────────────────
+var label lbl_green = na
+var label lbl_off   = na
+var label lbl_red   = na
+var label lbl_melt  = na
+
+if barstate.islast
+    label.delete(lbl_green)
+    label.delete(lbl_off)
+    label.delete(lbl_red)
+    label.delete(lbl_melt)
+    lbl_green := label.new(bar_index + 5, 0,         "Green Light / Balance", color=color.new(color.white, 80), textcolor=color.white, style=label.style_label_left, size=size.small)
+    lbl_off   := label.new(bar_index + 5, t_stress,  "Risk-Off",              color=color.new(c_stress, 70),    textcolor=color.white, style=label.style_label_left, size=size.small)
+    lbl_red   := label.new(bar_index + 5, t_extreme, "Red Light",             color=color.new(c_extreme, 70),   textcolor=color.white, style=label.style_label_left, size=size.small)
+    lbl_melt  := label.new(bar_index + 5, t_crash,   "Meltdown",              color=color.new(c_crash, 70),     textcolor=color.white, style=label.style_label_left, size=size.small)
+
+// ─── ALERTS ───────────────────────────────────────────────────────────
+alertcondition(ta.crossover(regime, 0),         "Regime → Risk On",  "Risk Regime crossed above zero — conditions improving")
+alertcondition(ta.crossunder(regime, 0),        "Regime → Caution",  "Risk Regime crossed below zero — conditions deteriorating")
+alertcondition(ta.crossunder(regime, t_stress), "Regime → Stress",   "Risk Regime crossed below stress line — reduce exposure")
+alertcondition(ta.crossover(regime, t_stress),  "Regime → Recovery", "Risk Regime crossed above stress line — stress easing")
