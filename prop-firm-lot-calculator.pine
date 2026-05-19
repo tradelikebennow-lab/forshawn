@@ -1,0 +1,398 @@
+// =====================================================================
+// Prop Firm Lot Size Calculator — Multi-Firm, Multi-Instrument
+// =====================================================================
+// Supports: Tradona Markets · The Funded Talent · FundingPips · FTMO · The5ers · Optional
+// Instruments: XAUUSD, US30, NAS100, US500, GER40, UK100, JP225,
+//              HK33, AUS200, EU50, XAGUSD, USOIL, standard Forex pairs, and more.
+//
+// ⚠ REPAINTING: None. All values derived from user inputs + current price.
+//
+// HOW IT WORKS:
+//   1. Select your prop firm
+//   2. Enter account balance + risk %
+//   3. Set your Entry and Stop Loss prices
+//   4. Table shows lot size, risk $, R:R, and TP lot sizing
+//
+// The key difference between firms is the CONTRACT SIZE for indices
+// and some commodities. This script handles that automatically.
+// =====================================================================
+//@version=6
+indicator("Prop Firm Lot Calculator [TX]", overlay=true, max_labels_count=10)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────
+
+// ① Your Account — set once, rarely changes
+string propFirm      = input.string("Tradona", "Prop Firm", options=["Tradona", "The Funded Talent", "FundingPips", "FTMO", "The5ers", "Optional", "Custom"], group="① Your Account")
+float  accountBal     = input.float(100000, "Account Balance ($)", minval=1, step=1000, group="① Your Account")
+string riskMode       = input.string("Percentage", "Risk Mode", options=["Percentage", "Fixed Amount"], group="① Your Account", tooltip="Percentage = risk a % of your balance each trade.\nFixed Amount = risk the same $ amount every trade.")
+float  riskPct        = input.float(1.0, "Risk (%)", minval=0.01, maxval=100, step=0.25, group="① Your Account", tooltip="Only used when Risk Mode = Percentage.")
+float  riskFixed      = input.float(500.0, "Risk Amount ($)", minval=1, step=50, group="① Your Account", tooltip="Only used when Risk Mode = Fixed Amount.")
+
+// ② Your Trade — change this every trade
+float  entryPrice     = input.float(0.0, "Entry Price", minval=0, step=0.01, group="② Your Trade", tooltip="Leave at 0 to use the current market price.")
+float  slPrice        = input.float(0.0, "Stop Loss", minval=0, step=0.01, group="② Your Trade")
+float  tpPrice        = input.float(0.0, "Take Profit", minval=0, step=0.01, group="② Your Trade", tooltip="Optional — set to 0 to skip.")
+
+// ③ Advanced — only change if needed
+float  lotStep        = input.float(0.01, "Lot Step", minval=0.001, maxval=1.0, step=0.01, group="③ Advanced", tooltip="Smallest lot increment your broker allows.\n0.01 = most brokers  |  0.1 = some indices  |  1.0 = mini lots")
+float  customContractSize = input.float(1.0, "Custom Contract Size", minval=0.001, step=1, group="③ Advanced", tooltip="Only used when Prop Firm = Custom.\nThis is the $ value per 1.0 price move per 1 lot.")
+string tablePos       = input.string("Top Right", "Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right", "Middle Right"], group="③ Advanced")
+int    textSizeOpt    = input.int(2, "Text Size", minval=0, maxval=3, step=1, group="③ Advanced", tooltip="0 = Tiny  |  1 = Small  |  2 = Normal  |  3 = Large")
+bool   showLines      = input.bool(true, "Show Lines on Chart", group="③ Advanced")
+color  entryColor     = input.color(color.white, "Entry Color", group="③ Advanced")
+color  slColor        = input.color(#FF5252, "Stop Loss Color", group="③ Advanced")
+color  tpColor        = input.color(#4CAF50, "Take Profit Color", group="③ Advanced")
+
+// ─── INSTRUMENT DETECTION ────────────────────────────────────────────
+// Normalise ticker to uppercase and strip common suffixes (.cash, .c, _SB, etc.)
+tickerRaw  = str.upper(syminfo.ticker)
+tickerRoot = str.upper(syminfo.root)
+
+// Helper: does the ticker contain a substring?
+isGold()    => str.contains(tickerRaw, "XAUUSD") or str.contains(tickerRoot, "XAUUSD") or str.contains(tickerRaw, "GOLD")
+isSilver()  => str.contains(tickerRaw, "XAGUSD") or str.contains(tickerRoot, "XAGUSD") or str.contains(tickerRaw, "SILVER")
+isUS30()    => str.contains(tickerRaw, "US30")  or str.contains(tickerRaw, "DJ30")  or str.contains(tickerRaw, "WS30") or str.contains(tickerRaw, "DJI")
+isNAS100()  => str.contains(tickerRaw, "NAS100") or str.contains(tickerRaw, "US100") or str.contains(tickerRaw, "USTEC") or str.contains(tickerRaw, "NDX")
+isUS500()   => str.contains(tickerRaw, "US500") or str.contains(tickerRaw, "SP500") or str.contains(tickerRaw, "SPX500") or str.contains(tickerRaw, "US2000")
+isGER40()   => str.contains(tickerRaw, "GER40") or str.contains(tickerRaw, "DE40")  or str.contains(tickerRaw, "DE30")  or str.contains(tickerRaw, "DAX") or str.contains(tickerRaw, "GDAXI")
+isUK100()   => str.contains(tickerRaw, "UK100") or str.contains(tickerRaw, "FTSE")
+isJP225()   => str.contains(tickerRaw, "JP225") or str.contains(tickerRaw, "JPN225") or str.contains(tickerRaw, "NIKKEI") or str.contains(tickerRaw, "NI225")
+isHK33()    => str.contains(tickerRaw, "HK33")  or str.contains(tickerRaw, "HK50")  or str.contains(tickerRaw, "HSI")
+isAUS200()  => str.contains(tickerRaw, "AUS200") or str.contains(tickerRaw, "AU200") or str.contains(tickerRaw, "ASX200")
+isEU50()    => str.contains(tickerRaw, "STOXX50") or str.contains(tickerRaw, "EU50")  or str.contains(tickerRaw, "EUROSTOXX")
+isOil()     => str.contains(tickerRaw, "USOIL") or str.contains(tickerRaw, "XTIUSD") or str.contains(tickerRaw, "WTI") or str.contains(tickerRaw, "CRUDE") or str.contains(tickerRaw, "BRENT") or str.contains(tickerRaw, "XBRUSD")
+
+// Determine asset class
+isIndex()   => isUS30() or isNAS100() or isUS500() or isGER40() or isUK100() or isJP225() or isHK33() or isAUS200() or isEU50()
+isMetal()   => isGold() or isSilver()
+isForex()   => syminfo.type == "forex" and not isIndex() and not isMetal() and not isOil()
+
+// ─── CONTRACT SIZE LOOKUP ────────────────────────────────────────────
+// Returns: $ value per 1.0 price movement per 1 standard lot
+// This is the critical number that differs between prop firms.
+//
+// CONTRACT SIZE REFERENCE (per 1 lot, per $1 move in price):
+// ┌──────────┬──────────────┬──────────────────┬──────────────┬────────┬──────────┬──────────┐
+// │ Symbol   │ Tradona      │ The Funded Talent│ FundingPips  │ FTMO   │ The5ers  │ Optional │
+// ├──────────┼──────────────┼──────────────────┼──────────────┼────────┼──────────┼──────────┤
+// │ XAUUSD   │ 100 USD      │ 100 USD          │ 100          │ 100    │ 100      │ 100 USD  │
+// │ XAGUSD   │ 5000 USD     │ 5000 USD         │ 5000         │ 5000   │ 5000     │ 5000     │
+// │ US30     │ 10 USD       │ 10 USD           │ 5            │ 1      │ 1        │ 1 USD    │
+// │ NAS100   │ 10 USD       │ 10 USD           │ 20           │ 1      │ 1        │ 10 USD   │
+// │ US500    │ 10 USD       │ 10 USD           │ 10           │ 10     │ 10       │ 10 USD   │
+// │ GER40    │ 10×EURUSD    │ 10×EURUSD        │ 25×EURUSD    │ 1      │ 1        │ 10×EURUSD│
+// │ UK100    │ 10×GBPUSD    │ 10×GBPUSD        │ 10×GBPUSD    │ 1      │ 1        │ 10×GBPUSD│
+// │ JP225    │ 1000÷USDJPY  │ 1000÷USDJPY      │ 10÷USDJPY    │ 10     │ 10       │ 100÷USDJPY│
+// │ HK33     │ 10÷USDHKD   │ 10÷USDHKD        │ 10           │ 10     │ 10       │ —        │
+// │ AUS200   │ 10×AUDUSD   │ 10×AUDUSD        │ 10           │ 1      │ 1        │ —        │
+// │ EU50     │ —            │ —                │ —            │ —      │ —        │ 10×EURUSD│
+// │ USOIL    │ 100 USD      │ 100 USD          │ 100          │ 100    │ 100      │ 100      │
+// │ Forex    │ 100000       │ 100000           │ 100000       │ 100000 │ 100000   │ 100000   │
+// └──────────┴──────────────┴──────────────────┴──────────────┴────────┴──────────┴──────────┘
+// Tradona, The Funded Talent, Optional denominate non-USD indices in local currency.
+// FundingPips does the same for GER40, UK100, JP225.
+// Live FX rates are pulled via request.security() for accurate conversion.
+//
+// ⚠ IMPORTANT: Prop firms update specs periodically.
+//   Always verify against your platform's symbol specification.
+//   Use "Custom" mode + manual contract size if you spot a mismatch.
+
+// ─── LIVE FX RATES (for non-USD contract size conversion) ────────────
+// Tradona, The Funded Talent, Optional denominate indices in local currency.
+// FundingPips also uses non-USD for GER40, UK100, JP225.
+// We pull live daily rates to convert contract sizes to USD.
+float _rawEUR = request.security("FX_IDC:EURUSD", "D", close, ignore_invalid_symbol=true)
+float _rawGBP = request.security("FX_IDC:GBPUSD", "D", close, ignore_invalid_symbol=true)
+float _rawAUD = request.security("FX_IDC:AUDUSD", "D", close, ignore_invalid_symbol=true)
+float _rawJPY = request.security("FX_IDC:USDJPY", "D", close, ignore_invalid_symbol=true)
+float _rawHKD = request.security("FX_IDC:USDHKD", "D", close, ignore_invalid_symbol=true)
+
+float fxEURUSD = nz(_rawEUR, 1.08)
+float fxGBPUSD = nz(_rawGBP, 1.25)
+float fxAUDUSD = nz(_rawAUD, 0.65)
+float fxUSDJPY = nz(_rawJPY, 150.0)
+float fxUSDHKD = nz(_rawHKD, 7.80)
+
+// Detect if any FX feed is using fallback values
+bool  fxOffline = na(_rawEUR) or na(_rawGBP) or na(_rawAUD) or na(_rawJPY) or na(_rawHKD)
+
+isTradona() => propFirm == "Tradona" or propFirm == "The Funded Talent"
+isFundingPips() => propFirm == "FundingPips"
+isOptional() => propFirm == "Optional"
+
+getContractSize() =>
+    float cs = 1.0
+    if propFirm == "Custom"
+        cs := customContractSize
+    else if isGold()
+        cs := 100.0
+    else if isSilver()
+        cs := 5000.0
+    else if isOil()
+        cs := 100.0
+    else if isUS30()
+        // Tradona: 10 USD | FundingPips: 5 USD | Optional/FTMO/The5ers: 1 USD
+        cs := isTradona() ? 10.0 : isFundingPips() ? 5.0 : 1.0
+    else if isNAS100()
+        // Tradona: 10 USD | FundingPips: 20 USD | Optional: 10 USD | FTMO/The5ers: 1 USD
+        cs := isTradona() ? 10.0 : isFundingPips() ? 20.0 : isOptional() ? 10.0 : 1.0
+    else if isUS500()
+        cs := 10.0
+    else if isGER40()
+        // Tradona: 10 EUR | Optional: 10 EUR | FundingPips: 25 EUR | Others: 1 USD
+        cs := isTradona() or isOptional() ? 10.0 * fxEURUSD : isFundingPips() ? 25.0 * fxEURUSD : 1.0
+    else if isUK100()
+        // Tradona: 10 GBP | Optional: 10 GBP | FundingPips: 10 GBP | Others: 1 USD
+        cs := isTradona() or isOptional() or isFundingPips() ? 10.0 * fxGBPUSD : 1.0
+    else if isJP225()
+        // Tradona: 1000 JPY | Optional: 100 JPY | FundingPips: 10 JPY | Others: 10 USD
+        cs := isTradona() ? 1000.0 / fxUSDJPY : isOptional() ? 100.0 / fxUSDJPY : isFundingPips() ? 10.0 / fxUSDJPY : 10.0
+    else if isHK33()
+        // Tradona: 10 HKD → convert to USD
+        cs := isTradona() ? 10.0 / fxUSDHKD : 10.0
+    else if isAUS200()
+        // Tradona: 10 AUD → convert to USD
+        cs := isTradona() ? 10.0 * fxAUDUSD : 1.0
+    else if isEU50()
+        // Optional: 10 EUR → convert to USD | Others: 10 EUR (same pattern)
+        cs := 10.0 * fxEURUSD
+    else if isForex()
+        cs := 100000.0
+    else
+        // Fallback: try to derive from syminfo if available
+        cs := syminfo.pointvalue > 0 ? syminfo.pointvalue / syminfo.mintick : 1.0
+    cs
+
+contractSize = getContractSize()
+
+// ─── ASSET LABEL ─────────────────────────────────────────────────────
+getAssetLabel() =>
+    string lbl = syminfo.ticker
+    if isGold()
+        lbl := "XAUUSD"
+    else if isSilver()
+        lbl := "XAGUSD"
+    else if isUS30()
+        lbl := "US30"
+    else if isNAS100()
+        lbl := "NAS100"
+    else if isUS500()
+        lbl := "US500"
+    else if isGER40()
+        lbl := "GER40"
+    else if isUK100()
+        lbl := "UK100"
+    else if isJP225()
+        lbl := "JP225"
+    else if isHK33()
+        lbl := "HK33"
+    else if isAUS200()
+        lbl := "AUS200"
+    else if isEU50()
+        lbl := "EU50"
+    else if isOil()
+        lbl := "OIL"
+    lbl
+
+// ─── CALCULATION ─────────────────────────────────────────────────────
+float entry      = entryPrice > 0 ? entryPrice : close
+float riskAmount = riskMode == "Percentage" ? accountBal * (riskPct / 100.0) : riskFixed
+float riskDispPct = riskMode == "Percentage" ? riskPct : (riskFixed / accountBal) * 100.0
+
+// SL distance in price units
+float slDist     = math.abs(entry - slPrice)
+
+// ─── INPUT VALIDATION ────────────────────────────────────────────────
+// Detect common input errors and surface clear warnings
+string warning   = ""
+
+if slPrice <= 0
+    warning := "⚠ Set a Stop Loss price"
+else if slPrice == entry
+    warning := "⚠ SL cannot equal Entry"
+else if slDist / entry < 0.00001
+    warning := "⚠ SL too close to Entry"
+else if tpPrice > 0
+    // Check TP is on correct side of entry
+    if slPrice < entry and tpPrice < entry
+        warning := "⚠ TP below Entry on Long"
+    else if slPrice > entry and tpPrice > entry
+        warning := "⚠ TP above Entry on Short"
+
+// ─── LOT SIZE + ROUNDING ────────────────────────────────────────────
+// Raw lot size (unrounded)
+float lotSizeRaw = slDist > 0 and contractSize > 0 ? riskAmount / (slDist * contractSize) : 0.0
+
+// Round DOWN to nearest lot step (never round up — that would exceed risk)
+float lotSize    = lotStep > 0 ? math.floor(lotSizeRaw / lotStep) * lotStep : lotSizeRaw
+
+// Adjusted actual risk after rounding (will be ≤ intended risk)
+float actualRisk = slDist * contractSize * lotSize
+float riskDiff   = riskAmount - actualRisk
+
+// Direction
+bool  isLong     = slPrice < entry
+bool  isShort    = slPrice > entry
+
+// Risk:Reward
+float tpDist     = tpPrice > 0 ? math.abs(tpPrice - entry) : 0.0
+float rrRatio    = slDist > 0 and tpDist > 0 ? tpDist / slDist : 0.0
+
+// P&L at TP (uses rounded lot size)
+float tpProfit   = tpDist * contractSize * lotSize
+
+// ─── FORMATTING HELPERS ──────────────────────────────────────────────
+fmtLot(float v) =>
+    if v >= 100
+        str.tostring(v, "#.##")
+    else if v >= 1
+        str.tostring(v, "#.##")
+    else
+        str.tostring(v, "#.####")
+
+fmtMoney(float v) =>
+    "$" + str.tostring(v, "#,##0.00")
+
+fmtPrice(float v) =>
+    str.tostring(v, "#,##0.00###")
+
+fmtRR(float v) =>
+    "1:" + str.tostring(v, "#.##")
+
+// ─── TABLE ───────────────────────────────────────────────────────────
+var tblPos = tablePos == "Top Left" ? position.top_left : tablePos == "Top Right" ? position.top_right : tablePos == "Bottom Left" ? position.bottom_left : tablePos == "Bottom Right" ? position.bottom_right : position.middle_right
+
+var txtSize = textSizeOpt == 0 ? size.tiny : textSizeOpt == 1 ? size.small : textSizeOpt == 2 ? size.normal : size.large
+
+var table infoTable = table.new(tblPos, 2, 15, bgcolor=color.new(#1a1a2e, 10), border_color=color.new(#333366, 20), border_width=1, frame_color=color.new(#333366, 20), frame_width=2)
+
+if barstate.islast
+    // Colors
+    headerBg  = color.new(#16213e, 0)
+    headerTxt = color.new(#e0e0e0, 0)
+    labelCol  = color.new(#8888aa, 0)
+    valueCol  = color.new(#ffffff, 0)
+    warnCol   = color.new(#FFD600, 0)
+    warnBg    = color.new(#3e3516, 0)
+    
+    row = 0
+    
+    // Row 0: Firm + Asset header
+    table.cell(infoTable, 0, row, "⚡ " + propFirm, text_color=headerTxt, text_size=txtSize, bgcolor=headerBg, text_halign=text.align_left)
+    table.cell(infoTable, 1, row, getAssetLabel(), text_color=color.new(#ffab40, 0), text_size=txtSize, bgcolor=headerBg, text_halign=text.align_right)
+    
+    // Show warning row if there's a validation issue
+    if warning != ""
+        row += 1
+        table.cell(infoTable, 0, row, warning, text_color=warnCol, text_size=txtSize, bgcolor=warnBg, text_halign=text.align_left)
+        table.cell(infoTable, 1, row, "", text_color=warnCol, text_size=txtSize, bgcolor=warnBg, text_halign=text.align_right)
+    
+    // Show FX warning for firms using live FX conversion on non-USD instruments
+    bool needsFX = false
+    if isTradona()
+        needsFX := isGER40() or isUK100() or isJP225() or isHK33() or isAUS200()
+    else if isFundingPips()
+        needsFX := isGER40() or isUK100() or isJP225()
+    else if isOptional()
+        needsFX := isGER40() or isUK100() or isJP225() or isEU50()
+    if isEU50()
+        needsFX := true
+    if needsFX and fxOffline
+        row += 1
+        table.cell(infoTable, 0, row, "⚠ FX offline — using fallback", text_color=warnCol, text_size=txtSize, bgcolor=warnBg, text_halign=text.align_left)
+        table.cell(infoTable, 1, row, "", text_color=warnCol, text_size=txtSize, bgcolor=warnBg, text_halign=text.align_right)
+    
+    if slPrice > 0
+        // Lot size color: green if valid, red if zero/invalid
+        lotCol = lotSize > 0 ? color.new(#00e676, 0) : color.new(#ff5252, 0)
+        
+        direction = isLong ? "LONG ▲" : isShort ? "SHORT ▼" : "—"
+        dirColor  = isLong ? color.new(#4CAF50, 0) : isShort ? color.new(#FF5252, 0) : labelCol
+    
+        row += 1
+        table.cell(infoTable, 0, row, "Contract Size", text_color=labelCol, text_size=txtSize, text_halign=text.align_left)
+        table.cell(infoTable, 1, row, str.tostring(contractSize, "#,##0.##"), text_color=valueCol, text_size=txtSize, text_halign=text.align_right)
+        
+        row += 1
+        table.cell(infoTable, 0, row, "Direction", text_color=labelCol, text_size=txtSize, text_halign=text.align_left)
+        table.cell(infoTable, 1, row, direction, text_color=dirColor, text_size=txtSize, text_halign=text.align_right)
+        
+        row += 1
+        table.cell(infoTable, 0, row, "───────────", text_color=color.new(#333366, 0), text_size=txtSize, text_halign=text.align_left)
+        table.cell(infoTable, 1, row, "───────────", text_color=color.new(#333366, 0), text_size=txtSize, text_halign=text.align_right)
+        
+        row += 1
+        table.cell(infoTable, 0, row, "Risk Target", text_color=labelCol, text_size=txtSize, text_halign=text.align_left)
+        table.cell(infoTable, 1, row, fmtMoney(riskAmount) + " (" + str.tostring(riskDispPct, "#.##") + "%)", text_color=color.new(#FF5252, 0), text_size=txtSize, text_halign=text.align_right)
+        
+        row += 1
+        table.cell(infoTable, 0, row, "SL Distance", text_color=labelCol, text_size=txtSize, text_halign=text.align_left)
+        table.cell(infoTable, 1, row, fmtPrice(slDist) + " pts", text_color=valueCol, text_size=txtSize, text_halign=text.align_right)
+        
+        row += 1
+        table.cell(infoTable, 0, row, "▶ LOT SIZE", text_color=color.new(#000000, 0), text_size=txtSize, bgcolor=lotCol, text_halign=text.align_left)
+        // Show rounded lot + raw in parentheses if they differ
+        string lotDisplay = fmtLot(lotSize) + " lots"
+        if math.abs(lotSizeRaw - lotSize) > 0.0001
+            lotDisplay := fmtLot(lotSize) + " lots (raw: " + fmtLot(lotSizeRaw) + ")"
+        table.cell(infoTable, 1, row, lotDisplay, text_color=color.new(#000000, 0), text_size=txtSize, bgcolor=lotCol, text_halign=text.align_right)
+        
+        row += 1
+        table.cell(infoTable, 0, row, "Actual Risk", text_color=labelCol, text_size=txtSize, text_halign=text.align_left)
+        // Show actual risk + saved amount if rounding made a difference
+        string riskDisplay = "-" + fmtMoney(actualRisk)
+        if riskDiff > 0.01
+            riskDisplay := "-" + fmtMoney(actualRisk) + " (↓" + fmtMoney(riskDiff) + ")"
+        table.cell(infoTable, 1, row, riskDisplay, text_color=color.new(#FF5252, 0), text_size=txtSize, text_halign=text.align_right)
+        
+        // TP section (only if TP is set)
+        if tpPrice > 0
+            row += 1
+            table.cell(infoTable, 0, row, "R:R", text_color=labelCol, text_size=txtSize, text_halign=text.align_left)
+            table.cell(infoTable, 1, row, fmtRR(rrRatio), text_color=color.new(#4CAF50, 0), text_size=txtSize, text_halign=text.align_right)
+            
+            row += 1
+            table.cell(infoTable, 0, row, "TP Profit", text_color=labelCol, text_size=txtSize, text_halign=text.align_left)
+            table.cell(infoTable, 1, row, "+" + fmtMoney(tpProfit), text_color=color.new(#4CAF50, 0), text_size=txtSize, text_halign=text.align_right)
+
+// ─── LINES ───────────────────────────────────────────────────────────
+// Draw horizontal lines for Entry, SL, TP
+var line entryLine = na
+var line slLine    = na
+var line tpLine    = na
+var label entryLbl = na
+var label slLbl    = na
+var label tpLbl    = na
+
+if barstate.islast and showLines and slPrice > 0
+    // Clean up old drawings
+    if not na(entryLine)
+        line.delete(entryLine)
+    if not na(slLine)
+        line.delete(slLine)
+    if not na(tpLine)
+        line.delete(tpLine)
+    if not na(entryLbl)
+        label.delete(entryLbl)
+    if not na(slLbl)
+        label.delete(slLbl)
+    if not na(tpLbl)
+        label.delete(tpLbl)
+    
+    int x1 = bar_index - 20
+    int x2 = bar_index + 20
+    
+    entryLine := line.new(x1, entry, x2, entry, color=entryColor, style=line.style_solid, width=2)
+    entryLbl  := label.new(x2 + 2, entry, "ENTRY " + fmtPrice(entry), color=color.new(entryColor, 80), textcolor=entryColor, style=label.style_label_left, size=size.small)
+    
+    slLine := line.new(x1, slPrice, x2, slPrice, color=slColor, style=line.style_dashed, width=2)
+    slLbl  := label.new(x2 + 2, slPrice, "SL " + fmtPrice(slPrice) + " │ -" + fmtMoney(actualRisk), color=color.new(slColor, 80), textcolor=slColor, style=label.style_label_left, size=size.small)
+    
+    if tpPrice > 0
+        tpLine := line.new(x1, tpPrice, x2, tpPrice, color=tpColor, style=line.style_dashed, width=2)
+        tpLbl  := label.new(x2 + 2, tpPrice, "TP " + fmtPrice(tpPrice) + " │ +" + fmtMoney(tpProfit), color=color.new(tpColor, 80), textcolor=tpColor, style=label.style_label_left, size=size.small)
+
+// ─── ALERTS ──────────────────────────────────────────────────────────
+// alert() accepts series strings; alertcondition() does not.
+if barstate.isconfirmed and slPrice > 0 and lotSize > 0
+    alert(syminfo.ticker + " | " + timeframe.period + " | Lot: " + str.tostring(lotSize, "#.####") + " | Risk: $" + str.tostring(riskAmount, "#.##") + " | SL: " + str.tostring(slPrice), alert.freq_once_per_bar)
